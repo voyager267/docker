@@ -1,16 +1,32 @@
-name: 导出 Elasticsearch arm64 镜像到 Release
+name: 导出 ELK arm64 离线镜像包
 
 on:
   workflow_dispatch:
     inputs:
-      es_version:
-        description: 'Elasticsearch 版本号（如 8.19.19）'
+      stack_version:
+        description: 'ELK 版本号（ES / Kibana 必须同版本）'
         required: true
         default: '8.19.19'
+      ik_version:
+        description: 'IK 插件版本（必须与 ES 版本完全一致）'
+        required: true
+        default: '8.19.19'
+      include_kibana:
+        description: '是否包含 Kibana'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      include_logstash:
+        description: '是否包含 Logstash（可选，镜像较大）'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 jobs:
-  export:
-    # 用原生 arm64 runner：拉下来的镜像天然就是 arm64，无需 QEMU
+  build:
+    # 原生 arm64 runner：构建出的镜像天然是 linux/arm64，无需 QEMU
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
@@ -19,33 +35,64 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 拉取官方 Elasticsearch arm64 镜像
+      - name: 写入带 IK 插件的 ES Dockerfile
         run: |
-          docker pull docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }}
+          mkdir -p build
+          cat > build/Dockerfile <<'EOF'
+          FROM docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.stack_version }}
+          # IK 插件必须和 ES 版本完全一致，否则 ES 无法启动
+          RUN elasticsearch-plugin install --batch \
+            https://get.infini.cloud/elasticsearch/analysis-ik/${{ inputs.ik_version }}
+          EOF
+          cat build/Dockerfile
 
-      - name: 校验镜像架构并导出 tar.gz
+      - name: 构建 ES + IK 镜像
         run: |
-          echo "=== 镜像架构 ==="
-          docker image inspect docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }} \
-            --format '{{.Os}}/{{.Architecture}}'
-          echo "=== 导出中 ==="
-          docker save docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }} \
-            | gzip > es-${{ inputs.es_version }}-arm64.tar.gz
-          ls -lh es-*.tar.gz
+          docker build -t es-ik:${{ inputs.stack_version }} build/
+          echo "=== 校验架构 ==="
+          docker image inspect es-ik:${{ inputs.stack_version }} --format '{{.Os}}/{{.Architecture}}'
+          echo "=== 校验 IK 插件 ==="
+          docker run --rm --entrypoint elasticsearch-plugin es-ik:${{ inputs.stack_version }} list | grep -i ik || true
 
-      - name: 上传到 Release（绕过 Artifact 500MB 限制）
+      - name: 导出 ES 镜像
+        run: |
+          docker save es-ik:${{ inputs.stack_version }} | gzip > es-ik-${{ inputs.stack_version }}-arm64.tar.gz
+          ls -lh es-ik-*.tar.gz
+
+      - name: 导出 Kibana（可选）
+        if: ${{ inputs.include_kibana == 'true' }}
+        run: |
+          docker pull docker.elastic.co/kibana/kibana:${{ inputs.stack_version }}
+          docker save docker.elastic.co/kibana/kibana:${{ inputs.stack_version }} \
+            | gzip > kibana-${{ inputs.stack_version }}-arm64.tar.gz
+          ls -lh kibana-*.tar.gz
+
+      - name: 导出 Logstash（可选）
+        if: ${{ inputs.include_logstash == 'true' }}
+        run: |
+          docker pull docker.elastic.co/logstash/logstash:${{ inputs.stack_version }}
+          docker save docker.elastic.co/logstash/logstash:${{ inputs.stack_version }} \
+            | gzip > logstash-${{ inputs.stack_version }}-arm64.tar.gz
+          ls -lh logstash-*.tar.gz
+
+      - name: 生成校验和
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: 上传到 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: es-${{ inputs.es_version }}-arm64
-          name: Elasticsearch ${{ inputs.es_version }} (arm64)
+          tag_name: elk-${{ inputs.stack_version }}-arm64
+          name: ELK Stack ${{ inputs.stack_version }} arm64 离线包
           body: |
-            Elasticsearch 官方 arm64 镜像离线包。
+            Elasticsearch（含 IK 中文分词）${{ inputs.stack_version }} arm64 离线镜像。
 
-            版本：${{ inputs.es_version }}
-            架构：linux/arm64
+            包含：
+            - es-ik-${{ inputs.stack_version }}-arm64.tar.gz （ES + IK）
+            ${{ inputs.include_kibana == 'true' && format('- kibana-{0}-arm64.tar.gz', inputs.stack_version) || '' }}
+            ${{ inputs.include_logstash == 'true' && format('- logstash-{0}-arm64.tar.gz', inputs.stack_version) || '' }}
 
-            内网导入：
-            ```bash
-            docker load -i es-${{ inputs.es_version }}-arm64.tar.gz
-            ```
-          files: es-*.tar.gz
+            导入：docker load -i <文件名>
+            校验：sha256sum -c SHA256SUMS.txt
+          files: |
+            *.tar.gz
+            SHA256SUMS.txt
