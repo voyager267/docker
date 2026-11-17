@@ -1,0 +1,51 @@
+name: 导出 Elasticsearch arm64 镜像到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      es_version:
+        description: 'Elasticsearch 版本号（如 8.19.19）'
+        required: true
+        default: '8.19.19'
+
+jobs:
+  export:
+    # 用原生 arm64 runner：拉下来的镜像天然就是 arm64，无需 QEMU
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 拉取官方 Elasticsearch arm64 镜像
+        run: |
+          docker pull docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }}
+
+      - name: 校验镜像架构并导出 tar.gz
+        run: |
+          echo "=== 镜像架构 ==="
+          docker image inspect docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }} \
+            --format '{{.Os}}/{{.Architecture}}'
+          echo "=== 导出中 ==="
+          docker save docker.elastic.co/elasticsearch/elasticsearch:${{ inputs.es_version }} \
+            | gzip > es-${{ inputs.es_version }}-arm64.tar.gz
+          ls -lh es-*.tar.gz
+
+      - name: 上传到 Release（绕过 Artifact 500MB 限制）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: es-${{ inputs.es_version }}-arm64
+          name: Elasticsearch ${{ inputs.es_version }} (arm64)
+          body: |
+            Elasticsearch 官方 arm64 镜像离线包。
+
+            版本：${{ inputs.es_version }}
+            架构：linux/arm64
+
+            内网导入：
+            ```bash
+            docker load -i es-${{ inputs.es_version }}-arm64.tar.gz
+            ```
+          files: es-*.tar.gz
